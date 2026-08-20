@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>Bitácora Lectora</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root, .viz-root {
     color-scheme: light;
@@ -88,6 +89,10 @@
     display: flex; align-items: center; justify-content: center; font-size: 18px;
   }
   .icon-btn:hover { background: var(--gridline); color: var(--text-primary); }
+  .icon-btn.drive-conectado { color: var(--series-1); }
+  .icon-btn.drive-error { color: var(--series-2); }
+  .icon-btn.drive-sincronizando { animation: girar 0.9s linear infinite; }
+  @keyframes girar { to { transform: rotate(360deg); } }
 
   nav.tabs {
     display: flex; gap: 4px; padding: 0 16px; background: var(--surface-1);
@@ -310,6 +315,7 @@
   <header class="topbar">
     <h1>Bitácora Lectora</h1>
     <div class="topbar-actions">
+      <button class="icon-btn" id="btn-drive" title="Conectar con Google Drive">☁</button>
       <button class="icon-btn" id="btn-exportar" title="Exportar datos (JSON)">⇩</button>
       <button class="icon-btn" id="btn-importar" title="Importar datos (JSON)">⇧</button>
       <input type="file" id="input-importar" accept="application/json" class="oculto">
@@ -525,7 +531,10 @@ try { libros = JSON.parse(localStorage.getItem(LS_LIBROS) || '[]'); } catch(e){ 
 let prefs = { fontSize: 19, fontFamily: 'sans', tema: 'claro' };
 try { prefs = Object.assign(prefs, JSON.parse(localStorage.getItem(LS_PREFS) || '{}')); } catch(e){}
 
-function guardarLibros(){ localStorage.setItem(LS_LIBROS, JSON.stringify(libros)); }
+function guardarLibros(){
+  localStorage.setItem(LS_LIBROS, JSON.stringify(libros));
+  sincronizarDebounced();
+}
 function guardarPrefs(){ localStorage.setItem(LS_PREFS, JSON.stringify(prefs)); }
 
 /* ---------- IndexedDB: contenido de archivos (txt/epub) ---------- */
@@ -565,6 +574,190 @@ async function borrarArchivo(id){
     tx.onerror = () => reject(tx.error);
   });
 }
+
+/* ---------- Sincronización con Google Drive ---------- */
+const GOOGLE_CLIENT_ID = '249237668522-87kn9qcp7kc6g3341pqspr48cbuom90p.apps.googleusercontent.com';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_FILENAME = 'bitacora-lectora-datos.json';
+const LS_DRIVE_CONECTADO = 'bl_drive_conectado';
+const LS_DRIVE_FILE_ID = 'bl_drive_file_id';
+
+let tokenClient = null;
+let accessToken = null;
+let tokenExpiraEn = 0;
+let sincronizando = false;
+let sincronizarTimer = null;
+
+function esperarGoogleListo(intentosRestantes){
+  return new Promise((resolve, reject) => {
+    (function intentar(restantes){
+      if (window.google && google.accounts && google.accounts.oauth2) { resolve(); return; }
+      if (restantes <= 0) { reject(new Error('Google Identity Services no cargó (¿sin conexión, o abierta desde un archivo local?)')); return; }
+      setTimeout(() => intentar(restantes - 1), 300);
+    })(intentosRestantes == null ? 20 : intentosRestantes);
+  });
+}
+
+async function asegurarTokenClient(){
+  if (tokenClient) return;
+  await esperarGoogleListo();
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: () => {}
+  });
+}
+
+function pedirToken(interactivo){
+  return new Promise((resolve, reject) => {
+    tokenClient.callback = (resp) => {
+      if (!resp || resp.error) { reject(resp || new Error('No se obtuvo autorización')); return; }
+      accessToken = resp.access_token;
+      tokenExpiraEn = Date.now() + (Number(resp.expires_in || 3600) * 1000 - 60000);
+      resolve(accessToken);
+    };
+    tokenClient.error_callback = (err) => reject(err);
+    try {
+      tokenClient.requestAccessToken({ prompt: interactivo ? 'consent' : '' });
+    } catch (e) { reject(e); }
+    if (!interactivo) {
+      setTimeout(() => reject(new Error('timeout-silencioso')), 4000);
+    }
+  });
+}
+
+async function obtenerTokenValido(interactivo){
+  if (accessToken && Date.now() < tokenExpiraEn) return accessToken;
+  await asegurarTokenClient();
+  return pedirToken(interactivo);
+}
+
+function actualizarBotonDrive(estado){
+  const btn = document.getElementById('btn-drive');
+  btn.classList.remove('drive-conectado', 'drive-error', 'drive-sincronizando');
+  if (estado === 'sincronizando') {
+    btn.classList.add('drive-sincronizando');
+    btn.title = 'Sincronizando con Drive…';
+  } else if (estado === 'ok') {
+    btn.classList.add('drive-conectado');
+    const hora = new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit' });
+    btn.title = `Sincronizado con Drive · ${hora} (clic para sincronizar ahora)`;
+  } else if (estado === 'error') {
+    btn.classList.add('drive-error');
+    btn.title = 'Error al sincronizar con Drive (clic para reintentar)';
+  } else {
+    btn.title = 'Conectar con Google Drive';
+  }
+}
+
+async function buscarArchivoDrive(token){
+  const guardado = localStorage.getItem(LS_DRIVE_FILE_ID);
+  if (guardado) return guardado;
+  const q = encodeURIComponent(`name='${DRIVE_FILENAME}' and trashed=false`);
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&fields=files(id,name)`, {
+    headers: { Authorization: 'Bearer ' + token }
+  });
+  if (!res.ok) throw new Error('No se pudo buscar el archivo en Drive');
+  const data = await res.json();
+  const encontrado = data.files && data.files[0] ? data.files[0].id : null;
+  if (encontrado) localStorage.setItem(LS_DRIVE_FILE_ID, encontrado);
+  return encontrado;
+}
+
+async function descargarDeDrive(token, fileId){
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+    headers: { Authorization: 'Bearer ' + token }
+  });
+  if (res.status === 404) { localStorage.removeItem(LS_DRIVE_FILE_ID); return null; }
+  if (!res.ok) throw new Error('No se pudo descargar desde Drive');
+  try { return await res.json(); } catch (e) { return null; }
+}
+
+async function subirADrive(token, fileId, contenidoObj){
+  const cuerpo = JSON.stringify(contenidoObj, null, 2);
+  if (fileId) {
+    const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+      method: 'PATCH',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: cuerpo
+    });
+    if (res.status === 404) { localStorage.removeItem(LS_DRIVE_FILE_ID); return subirADrive(token, null, contenidoObj); }
+    if (!res.ok) throw new Error('No se pudo actualizar el archivo en Drive');
+    return fileId;
+  }
+  const metadata = { name: DRIVE_FILENAME, mimeType: 'application/json' };
+  const boundary = 'bl_boundary_' + Date.now();
+  const multipart =
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\nContent-Type: application/json\r\n\r\n${cuerpo}\r\n` +
+    `--${boundary}--`;
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': `multipart/related; boundary=${boundary}` },
+    body: multipart
+  });
+  if (!res.ok) throw new Error('No se pudo crear el archivo en Drive');
+  const data = await res.json();
+  localStorage.setItem(LS_DRIVE_FILE_ID, data.id);
+  return data.id;
+}
+
+function fusionarLibrosRemotos(remotos){
+  if (!Array.isArray(remotos)) return false;
+  let cambios = false;
+  const porId = new Map(libros.map(l => [l.id, l]));
+  remotos.forEach(r => {
+    const local = porId.get(r.id);
+    if (!local) {
+      libros.push(r);
+      cambios = true;
+    } else {
+      const tLocal = local.actualizado || local.fechaAgregado || '';
+      const tRemoto = r.actualizado || r.fechaAgregado || '';
+      if (tRemoto > tLocal) { Object.assign(local, r); cambios = true; }
+    }
+  });
+  return cambios;
+}
+
+async function sincronizarConDrive(interactivo){
+  if (sincronizando) return;
+  sincronizando = true;
+  actualizarBotonDrive('sincronizando');
+  try {
+    const token = await obtenerTokenValido(interactivo);
+    let fileId = await buscarArchivoDrive(token);
+    if (fileId) {
+      const remoto = await descargarDeDrive(token, fileId);
+      if (remoto && fusionarLibrosRemotos(remoto.libros)) {
+        localStorage.setItem(LS_LIBROS, JSON.stringify(libros));
+        const vistaActiva = document.querySelector('nav.tabs button.activo');
+        if (vistaActiva) irAVista(vistaActiva.dataset.vista);
+      }
+    }
+    fileId = await subirADrive(token, fileId, { libros, prefs, exportado: new Date().toISOString() });
+    localStorage.setItem(LS_DRIVE_CONECTADO, 'true');
+    actualizarBotonDrive('ok');
+  } catch (err) {
+    actualizarBotonDrive(localStorage.getItem(LS_DRIVE_CONECTADO) === 'true' ? 'error' : null);
+    if (interactivo) {
+      mostrarToast('No se pudo conectar con Drive. Revisa que abriste la app desde su dirección https:// y que aceptaste el acceso.');
+    }
+  } finally {
+    sincronizando = false;
+  }
+}
+
+function sincronizarDebounced(){
+  if (localStorage.getItem(LS_DRIVE_CONECTADO) !== 'true') return;
+  clearTimeout(sincronizarTimer);
+  sincronizarTimer = setTimeout(() => sincronizarConDrive(false), 2000);
+}
+
+document.getElementById('btn-drive').addEventListener('click', () => {
+  const yaConectado = localStorage.getItem(LS_DRIVE_CONECTADO) === 'true';
+  sincronizarConDrive(!yaConectado);
+});
 
 /* ---------- Navegación entre vistas ---------- */
 const vistas = ['por-leer','leyendo','terminados','estadisticas'];
@@ -693,6 +886,7 @@ function cambiarEstado(id, nuevoEstado){
   l.estado = nuevoEstado;
   if (nuevoEstado === 'leyendo' && !l.fechaInicio) l.fechaInicio = hoyISO();
   if (nuevoEstado === 'terminado' && !l.fechaFin) l.fechaFin = hoyISO();
+  l.actualizado = new Date().toISOString();
   guardarLibros();
   renderLista(nuevoEstado === 'terminado' ? 'terminado' : nuevoEstado);
   actualizarListaGeneros();
@@ -788,6 +982,7 @@ document.getElementById('btn-guardar-libro').addEventListener('click', async () 
   if (l.estado === 'leyendo' && !l.fechaInicio) l.fechaInicio = hoyISO();
   if (l.estado === 'terminado' && !l.fechaFin) l.fechaFin = hoyISO();
   if (!l.posicion) l.posicion = { pagina: 0, totalPaginas: 0 };
+  l.actualizado = new Date().toISOString();
 
   if (archivoPendiente) {
     const nombre = archivoPendiente.name;
@@ -1226,6 +1421,9 @@ window.addEventListener('resize', () => {
 /* ---------- Inicio ---------- */
 actualizarListaGeneros();
 renderLista('por-leer');
+if (localStorage.getItem(LS_DRIVE_CONECTADO) === 'true') {
+  setTimeout(() => sincronizarConDrive(false), 500);
+}
 
 })();
 </script>
